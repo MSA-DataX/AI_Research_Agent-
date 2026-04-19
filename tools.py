@@ -3,12 +3,26 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 from bs4 import BeautifulSoup
 from ddgs import DDGS
+
+
+def _retry(fn: Callable, tries: int = 3, base_delay: float = 0.8) -> Any:
+    last: Exception | None = None
+    for attempt in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if attempt < tries - 1:
+                time.sleep(base_delay * (1.8 ** attempt))
+    if last:
+        raise last
 
 from config import RESULTS_DIR
 
@@ -37,9 +51,10 @@ def web_search(query: str, max_results: int = 8, region: str = "de-de") -> list[
     if key in _SEARCH_CACHE:
         return _SEARCH_CACHE[key]
     results: list[dict] = []
-    try:
+
+    def _do() -> list[dict]:
         with DDGS() as ddgs:
-            raw = list(
+            return list(
                 ddgs.text(
                     query,
                     region=region,
@@ -47,6 +62,9 @@ def web_search(query: str, max_results: int = 8, region: str = "de-de") -> list[
                     max_results=max_results,
                 )
             )
+
+    try:
+        raw = _retry(_do, tries=3)
     except Exception as e:
         return [{"title": "[search error]", "url": "", "snippet": str(e)}]
     for r in raw:
@@ -65,13 +83,20 @@ def fetch_url(url: str, max_chars: int = 8000) -> str:
     key = (url, max_chars)
     if key in _FETCH_CACHE:
         return _FETCH_CACHE[key]
-    try:
-        r = httpx.get(
+
+    def _do() -> httpx.Response:
+        resp = httpx.get(
             url,
             timeout=20,
             follow_redirects=True,
             headers={"User-Agent": _UA},
         )
+        if resp.status_code >= 500:
+            resp.raise_for_status()
+        return resp
+
+    try:
+        r = _retry(_do, tries=3)
         r.raise_for_status()
     except Exception as e:
         return f"[fetch error] {e}"

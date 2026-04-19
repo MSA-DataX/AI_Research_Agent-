@@ -9,9 +9,11 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 
 import research_box as rb_store
+from agent import analyze_rows_rb as agent_analyze_rows
 from agent import run as agent_run
 from agent import validate_rb as agent_validate_rb
 from agent import verify_rb as agent_verify_rb
+from validators import METHODS as VALIDATION_METHODS
 from config import API_HOST, API_PORT
 
 app = FastAPI(
@@ -56,6 +58,34 @@ def verify(rb_id: str):
     if "error" in v:
         raise HTTPException(404, v["error"])
     return v
+
+
+@app.get("/validation_methods")
+def list_methods():
+    return VALIDATION_METHODS
+
+
+@app.post("/research_box/{rb_id}/analyze_rows")
+def analyze_rows(rb_id: str, methods: str = Query("", description="Comma-separated method names; empty = all")):
+    method_list = [m.strip() for m in methods.split(",") if m.strip()] or None
+    v = agent_analyze_rows(rb_id, methods=method_list)
+    if "error" in v:
+        raise HTTPException(404, v["error"])
+    return v
+
+
+@app.get("/research_box/{rb_id}/validation")
+def get_validation(rb_id: str):
+    import research_box as rb_store
+    rb = rb_store.load(rb_id)
+    if rb is None:
+        raise HTTPException(404, "research_box not found")
+    return {
+        "rb_id": rb.id,
+        "task": rb.task,
+        "status": rb.status,
+        "validation": rb.validation,
+    }
 
 
 @app.post("/research_box/{rb_id}/extend")

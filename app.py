@@ -17,9 +17,10 @@ except Exception:
     pass
 
 import research_box as rb_store
-from agent import run as agent_run
+from agent import analyze_rows_rb, run as agent_run
 from agent import validate_rb, verify_rb
 from config import API_PORT, RESULTS_DIR
+from validators import METHODS as VALIDATION_METHODS
 
 st.set_page_config(page_title="AI Research Agent", page_icon="🔎", layout="wide")
 
@@ -124,6 +125,33 @@ with st.sidebar:
     st.caption(f"📡 API: http://localhost:{API_PORT}")
     st.caption("Start: `python api.py`")
 
+    st.divider()
+    with st.expander("🧹 Aufräumen"):
+        import cleanup as _cleanup
+        s = _cleanup.stats()
+
+        def _fmt(b: int) -> str:
+            for unit in ("B", "KB", "MB", "GB"):
+                if b < 1024:
+                    return f"{b:.1f} {unit}"
+                b /= 1024
+            return f"{b:.1f} TB"
+
+        st.caption(f"📂 logs: {s['logs']['files']} · {_fmt(s['logs']['bytes'])}")
+        st.caption(f"📂 results: {s['results']['files']} · {_fmt(s['results']['bytes'])}")
+        st.caption(f"🗄️ db: {_fmt(s['database']['bytes'])} ({s['database']['rb_count']} RBs)")
+        st.caption(f"**total:** {_fmt(s['total_bytes'])}")
+
+        days = st.number_input("Älter als (Tage)", min_value=0, max_value=365, value=30, key="cleanup_days")
+        dry = _cleanup.prune_logs(days, dry_run=True).count + _cleanup.prune_results(days, dry_run=True).count
+        st.caption(f"→ {dry} Dateien wären betroffen")
+
+        if st.button("🗑️ Jetzt löschen", use_container_width=True, disabled=dry == 0):
+            r1 = _cleanup.prune_logs(days, dry_run=False)
+            r2 = _cleanup.prune_results(days, dry_run=False)
+            st.toast(f"Gelöscht: {r1.count + r2.count} Dateien · {_fmt(r1.freed_bytes + r2.freed_bytes)}", icon="🗑️")
+            st.rerun()
+
 
 tab_new, tab_history = st.tabs(["🆕 Neuer Task", "📚 Research Boxes"])
 
@@ -166,6 +194,7 @@ with tab_new:
         st.toast("⏹️ Stop-Signal gesendet", icon="⏹️")
 
     def _run_thread(t: str, q: queue.Queue, cancel: threading.Event, rb_id: str | None, extend: bool) -> None:
+        import traceback as _tb
         def on_event(ev: dict) -> None:
             q.put(("event", ev))
         try:
@@ -175,7 +204,7 @@ with tab_new:
             )
             q.put(("done", result))
         except Exception as e:
-            q.put(("error", str(e)))
+            q.put(("error", f"{type(e).__name__}: {e}\n\n{_tb.format_exc()[-1500:]}"))
 
     pending = st.session_state.get("pending_run")
     if start and task.strip() and not st.session_state["running"]:
@@ -285,9 +314,18 @@ with tab_new:
         st.divider()
 
         if "error" in result:
-            st.error(f"Fehler: {result['error']}")
+            err = str(result["error"])
+            st.error(f"❌ Fehler: {err.splitlines()[0][:200]}")
             if result.get("rb_id"):
                 st.caption(f"Research Box: `{result['rb_id']}`")
+            if "\n" in err or len(err) > 200:
+                with st.expander("Technische Details"):
+                    st.code(err)
+            low = err.lower()
+            if "connection" in low or "refused" in low or "reachable" in low:
+                st.info("💡 Prüfe: LM Studio läuft? Modell geladen? `lms load qwen3-14b` → dann Task neu starten.")
+            elif "invalid model" in low or "not loaded" in low:
+                st.info("💡 Modell nicht geladen. Führe aus: `lms load qwen3-14b`")
         else:
             rb_id = result.get("rb_id")
             if rb_id:
@@ -321,16 +359,48 @@ with tab_new:
                 st.session_state["last_result"]["validation"] = v
                 st.toast(f"Verify: {v.get('confidence')}% ({v.get('label')})", icon="🔍")
                 st.rerun()
-            if bc3.button("✅ Re-Validate", use_container_width=True, key="cmd_validate",
+            if bc3.button("🔬 Deep-Analyse (pro Zeile)", use_container_width=True, key="cmd_analyze",
+                          help="Wendet alle Validierungs-Methoden pro Zeile an"):
+                with st.spinner("Analysiere jede Zeile mit mehreren Methoden..."):
+                    v = analyze_rows_rb(rb_id)
+                st.session_state["last_result"]["validation"] = v
+                st.toast(f"Deep: {v.get('confidence')}% ({v.get('label')})", icon="🔬")
+                st.rerun()
+            if bc4.button("✅ Re-Validate", use_container_width=True, key="cmd_validate",
                           help="Schnelle Neuberechnung ohne Neu-Fetch"):
                 v = validate_rb(rb_id)
                 st.session_state["last_result"]["validation"] = v
                 st.toast("Validation neu berechnet", icon="✅")
                 st.rerun()
-            bc4.caption("📤 Export-Buttons oben")
 
-        with st.expander("Validation-Report"):
-            st.json(result.get("validation") or {})
+        v = result.get("validation") or {}
+        if v.get("mode") == "deep_analyze" and v.get("per_row"):
+            st.divider()
+            st.subheader("🔬 Pro-Zeile Analyse")
+            methods_used = v.get("methods_used", [])
+            rows = []
+            for r in v["per_row"]:
+                row = {
+                    "#": r["row_index"],
+                    "Name": r["name"][:60],
+                    "Verdict": r["verdict"],
+                    "Conf": f"{r['confidence']}%",
+                }
+                for m in methods_used:
+                    mr = r["methods"].get(m, {})
+                    row[m] = "✅" if mr.get("supported") else "❌"
+                rows.append(row)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+            st.markdown("**Methoden-Zusammenfassung:**")
+            for m, s in (v.get("methods_summary") or {}).items():
+                st.caption(f"• `{m}` → {s['supported']}/{s['total']} ({s['ratio']}%) — {VALIDATION_METHODS.get(m, '')}")
+
+            with st.expander("Details pro Zeile (Raw)"):
+                st.json(v["per_row"])
+        else:
+            with st.expander("Validation-Report"):
+                st.json(v)
         with st.expander("Besuchte Quellen (visited_sources)"):
             for u in result.get("visited_sources", []) or []:
                 st.markdown(f"- {u}")

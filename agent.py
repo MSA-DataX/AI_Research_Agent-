@@ -10,7 +10,8 @@ import validation
 from config import ENABLE_PLANNING, LOG_DIR, MAX_ITERATIONS
 from llm_client import chat, chat_with_tools
 from research_box import ResearchBox
-from tools import TOOL_SCHEMAS, TOOLS, fetch_url
+from tools import TOOL_SCHEMAS, TOOLS, fetch_url, web_search
+import validators
 
 SYSTEM_PROMPT = """You are a rigorous autonomous research agent.
 
@@ -315,6 +316,109 @@ def extend_rb(rb_id: str, **kwargs) -> dict:
     if rb is None:
         return {"error": "rb not found"}
     return run(rb.task, rb_id=rb_id, extend=True, **kwargs)
+
+
+def analyze_rows_rb(
+    rb_id: str,
+    methods: Optional[list[str]] = None,
+    on_event=None,
+) -> dict:
+    rb = rb_store.load(rb_id)
+    if rb is None:
+        return {"error": "rb not found"}
+
+    def emit(ev: dict) -> None:
+        if on_event:
+            try:
+                on_event(ev)
+            except Exception:
+                pass
+
+    chosen = methods or list(validators.METHODS.keys())
+    chosen = [m for m in chosen if m in validators.METHODS]
+
+    items: list[dict] = []
+    if isinstance(rb.extracted_data, list):
+        items = [x for x in rb.extracted_data if isinstance(x, dict)]
+    elif isinstance(rb.extracted_data, dict):
+        items = [rb.extracted_data]
+
+    page_cache: dict[str, str] = {}
+    per_row: list[dict] = []
+
+    for idx, it in enumerate(items):
+        src = it.get("source_url") or it.get("source") or ""
+        name = validators._row_name(it) or f"row {idx}"
+        emit({"type": "analyze_row", "index": idx, "total": len(items), "name": name})
+
+        page_text = ""
+        if src and ("name_substring" in chosen or "all_fields" in chosen):
+            if src not in page_cache:
+                page_cache[src] = fetch_url(src, max_chars=20000)
+            page_text = page_cache[src]
+
+        method_results: dict[str, dict] = {}
+        if "name_substring" in chosen:
+            method_results["name_substring"] = validators.method_name_substring(it, page_text)
+        if "all_fields" in chosen:
+            method_results["all_fields"] = validators.method_all_fields(it, page_text)
+        if "cross_source" in chosen:
+            method_results["cross_source"] = validators.method_cross_source(it, web_search)
+        if "llm_semantic" in chosen:
+            if not page_text and src:
+                if src not in page_cache:
+                    page_cache[src] = fetch_url(src, max_chars=20000)
+                page_text = page_cache[src]
+            method_results["llm_semantic"] = validators.method_llm_semantic(it, page_text, chat)
+
+        label, confidence = validators.verdict_for_row(method_results)
+        per_row.append(
+            {
+                "row_index": idx,
+                "name": name,
+                "source_url": src,
+                "methods": method_results,
+                "verdict": label,
+                "confidence": confidence,
+            }
+        )
+
+    total = len(per_row)
+    method_totals: dict[str, dict] = {}
+    for m in chosen:
+        sup = sum(1 for r in per_row if r["methods"].get(m, {}).get("supported"))
+        method_totals[m] = {
+            "supported": sup,
+            "total": total,
+            "ratio": round(100 * sup / total) if total else 0,
+        }
+
+    overall_conf = int(round(sum(r["confidence"] for r in per_row) / total)) if total else 0
+    if overall_conf >= 85:
+        overall_label = "high"
+    elif overall_conf >= 60:
+        overall_label = "medium"
+    elif overall_conf >= 30:
+        overall_label = "low"
+    else:
+        overall_label = "unverified"
+
+    report = {
+        "confidence": overall_conf,
+        "label": overall_label,
+        "total": total,
+        "methods_used": chosen,
+        "methods_summary": method_totals,
+        "per_row": per_row,
+        "mode": "deep_analyze",
+        "verified_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    rb.validation = report
+    rb.status = "verified"
+    rb.save()
+    emit({"type": "analyze_done", "validation": report})
+    return report
 
 
 def verify_rb(rb_id: str, on_event=None) -> dict:
