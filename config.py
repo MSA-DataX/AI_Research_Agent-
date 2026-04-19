@@ -14,3 +14,9 @@ _BASE = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR = os.path.join(_BASE, "results")
 LOG_DIR = os.path.join(_BASE, "logs")
 MEMORY_PATH = os.path.join(_BASE, "memory.json")
+DB_PATH = os.path.join(_BASE, "research.db")
+
+API_HOST = os.getenv("API_HOST", "127.0.0.1")
+API_PORT = int(os.getenv("API_PORT", "8000"))
+
+SIMILARITY_REUSE_THRESHOLD = 0.72
