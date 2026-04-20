@@ -17,12 +17,15 @@ def test_create_and_load(tmp_db):
 def test_add_sources_and_visited(tmp_db):
     import research_box as rb_store
     rb = rb_store.create("t")
-    rb.add_sources(["https://a.com", "https://b.com", "https://a.com"])  # duplicate ignored
+    rb.add_sources(["https://a.com", "https://b.com", "https://a.com"])
     assert len(rb.sources) == 2
 
     rb.mark_visited("https://a.com")
-    rb.mark_visited("https://a.com")  # idempotent
-    assert rb.visited_sources == ["https://a.com"]
+    rb.mark_visited("https://a.com")
+    assert len(rb.visited_sources) == 1
+
+    rb.add_sources(["https://www.a.com/?utm_source=x"])
+    assert len(rb.sources) == 2
 
 
 def test_save_roundtrip(tmp_db):
@@ -76,3 +79,38 @@ def test_find_similar_returns_none_below_threshold(tmp_db, monkeypatch):
     rb_store.create("topic alpha something")
     found = rb_store.find_similar("beta topic unrelated")
     assert found is None
+
+
+def test_validation_history_appends_snapshots(tmp_db):
+    import research_box as rb_store
+    rb = rb_store.create("t")
+    rb.validation = {"confidence": 50, "label": "low", "mode": "validate", "total": 2, "supported": 1}
+    rb.append_validation_snapshot()
+    rb.validation = {"confidence": 80, "label": "high", "mode": "verify", "total": 2, "supported": 2}
+    rb.append_validation_snapshot()
+    rb.save()
+
+    loaded = rb_store.load(rb.id)
+    assert len(loaded.validation_history) == 2
+    assert loaded.validation_history[0]["confidence"] == 50
+    assert loaded.validation_history[1]["confidence"] == 80
+    assert loaded.validation_history[1]["mode"] == "verify"
+
+
+def test_validation_history_capped_at_20(tmp_db):
+    import research_box as rb_store
+    rb = rb_store.create("t")
+    for i in range(30):
+        rb.validation = {"confidence": i, "label": "low", "mode": "validate"}
+        rb.append_validation_snapshot()
+    assert len(rb.validation_history) == 20
+    assert rb.validation_history[0]["confidence"] == 10
+    assert rb.validation_history[-1]["confidence"] == 29
+
+
+def test_validation_history_ignores_empty_validation(tmp_db):
+    import research_box as rb_store
+    rb = rb_store.create("t")
+    rb.validation = {}
+    rb.append_validation_snapshot()
+    assert rb.validation_history == []

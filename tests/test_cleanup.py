@@ -64,7 +64,63 @@ def test_prune_results_respects_threshold(tmp_path, monkeypatch):
     assert os.path.exists(str(res / "a.json"))
 
 
-def test_prune_rbs_status_filter(tmp_db, monkeypatch):
+def test_auto_cleanup_respects_throttle(tmp_path, monkeypatch):
+    import cleanup
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    _make_file(str(logs / "very_old.json"), age_days=60)
+    _make_file(str(logs / "fresh.json"), age_days=1)
+
+    marker = tmp_path / ".last_cleanup"
+    monkeypatch.setattr(cleanup, "LOG_DIR", str(logs))
+    monkeypatch.setattr(cleanup, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(cleanup, "AUTO_CLEANUP_ENABLED", True)
+    monkeypatch.setattr(cleanup, "AUTO_CLEANUP_INTERVAL_HOURS", 24)
+    monkeypatch.setattr(cleanup, "AUTO_CLEANUP_MARKER", str(marker))
+    monkeypatch.setattr(cleanup, "AUTO_CLEANUP_LOGS_DAYS", 30)
+    monkeypatch.setattr(cleanup, "AUTO_CLEANUP_RESULTS_DAYS", 30)
+    monkeypatch.setattr(cleanup, "AUTO_CLEANUP_RBS_DAYS", 0)
+
+    r1 = cleanup.auto_cleanup()
+    assert r1 is not None
+    assert r1["logs_removed"] == 1
+    assert os.path.exists(str(marker))
+
+    r2 = cleanup.auto_cleanup()
+    assert r2 is None
+
+
+def test_auto_cleanup_disabled(tmp_path, monkeypatch):
+    import cleanup
+    monkeypatch.setattr(cleanup, "AUTO_CLEANUP_ENABLED", False)
+    assert cleanup.auto_cleanup() is None
+
+
+def test_auto_cleanup_force_bypasses_throttle(tmp_path, monkeypatch):
+    import cleanup
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    _make_file(str(logs / "old.json"), age_days=60)
+    marker = tmp_path / ".last_cleanup"
+    marker.write_text("just now")
+
+    monkeypatch.setattr(cleanup, "LOG_DIR", str(logs))
+    monkeypatch.setattr(cleanup, "RESULTS_DIR", str(tmp_path / "results"))
+    monkeypatch.setattr(cleanup, "AUTO_CLEANUP_ENABLED", True)
+    monkeypatch.setattr(cleanup, "AUTO_CLEANUP_INTERVAL_HOURS", 24)
+    monkeypatch.setattr(cleanup, "AUTO_CLEANUP_MARKER", str(marker))
+    monkeypatch.setattr(cleanup, "AUTO_CLEANUP_LOGS_DAYS", 30)
+    monkeypatch.setattr(cleanup, "AUTO_CLEANUP_RESULTS_DAYS", 30)
+    monkeypatch.setattr(cleanup, "AUTO_CLEANUP_RBS_DAYS", 0)
+
+    r = cleanup.auto_cleanup()
+    assert r is None  # throttled
+    r = cleanup.auto_cleanup(force=True)
+    assert r is not None
+    assert r["logs_removed"] == 1
+
+
+def test_prune_rbs_status_filter(tmp_db):
     import sqlite3
     from datetime import datetime, timedelta
 

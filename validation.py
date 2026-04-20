@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from url_utils import canonicalize_url
+
 
 def compute(extracted_data: Any, visited_sources: list[str]) -> dict:
     items: list[dict] = []
@@ -12,7 +14,7 @@ def compute(extracted_data: Any, visited_sources: list[str]) -> dict:
 
     total = len(items)
     n_visited = len(visited_sources or [])
-    visited_set = set(visited_sources or [])
+    visited_set = {canonicalize_url(u) for u in (visited_sources or [])}
 
     if total == 0:
         return {
@@ -28,7 +30,7 @@ def compute(extracted_data: Any, visited_sources: list[str]) -> dict:
     per_item: list[dict] = []
     for it in items:
         src = it.get("source_url") or it.get("source") or it.get("sourceUrl") or ""
-        ok = bool(src) and src in visited_set
+        ok = bool(src) and canonicalize_url(src) in visited_set
         name = it.get("name") or it.get("title") or next(iter(it.values()), "?")
         per_item.append(
             {

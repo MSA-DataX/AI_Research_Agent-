@@ -7,7 +7,10 @@ def test_list_empty(tmp_db):
     c = TestClient(app)
     r = c.get("/research_box")
     assert r.status_code == 200
-    assert r.json() == []
+    body = r.json()
+    assert body["total"] == 0
+    assert body["items"] == []
+    assert body["offset"] == 0
 
 
 def test_get_not_found(tmp_db):
@@ -25,9 +28,39 @@ def test_validation_methods_endpoint(tmp_db):
     r = c.get("/validation_methods")
     assert r.status_code == 200
     body = r.json()
-    assert "name_substring" in body
-    assert "llm_semantic" in body
-    assert "cross_source" in body
+    assert "name_substring" in body["methods"]
+    assert "llm_semantic" in body["methods"]
+    assert "cross_source" in body["methods"]
+
+
+def test_pagination_offset_and_limit(tmp_db):
+    import research_box as rb_store
+    from fastapi.testclient import TestClient
+    from api import app
+    for i in range(5):
+        rb_store.create(f"task {i}")
+    c = TestClient(app)
+
+    r = c.get("/research_box?offset=0&limit=2")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 5
+    assert len(body["items"]) == 2
+
+    r = c.get("/research_box?offset=4&limit=10")
+    assert len(r.json()["items"]) == 1
+
+
+def test_openapi_schema_loads(tmp_db):
+    from fastapi.testclient import TestClient
+    from api import app
+    c = TestClient(app)
+    r = c.get("/openapi.json")
+    assert r.status_code == 200
+    paths = r.json().get("paths", {})
+    assert "/research_box" in paths
+    assert "/jobs" in paths
+    assert "/jobs/{job_id}" in paths
 
 
 def test_get_and_delete(tmp_db):

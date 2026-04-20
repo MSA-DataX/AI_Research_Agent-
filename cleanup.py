@@ -6,7 +6,16 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from config import LOG_DIR, RESULTS_DIR
+from config import (
+    AUTO_CLEANUP_ENABLED,
+    AUTO_CLEANUP_INTERVAL_HOURS,
+    AUTO_CLEANUP_LOGS_DAYS,
+    AUTO_CLEANUP_MARKER,
+    AUTO_CLEANUP_RBS_DAYS,
+    AUTO_CLEANUP_RESULTS_DAYS,
+    LOG_DIR,
+    RESULTS_DIR,
+)
 
 
 @dataclass
@@ -113,6 +122,50 @@ def prune_rbs(
             rb_store.delete(rb.id)
         deleted.append(rb.id)
     return PruneResult(deleted, 0)
+
+
+def auto_cleanup(force: bool = False) -> dict | None:
+    """Startup-Hook: läuft max. 1× pro AUTO_CLEANUP_INTERVAL_HOURS, still und schnell.
+
+    Returns:
+        dict mit Zusammenfassung wenn gelaufen, None wenn geskippt (throttled/disabled/error).
+    """
+    if not AUTO_CLEANUP_ENABLED and not force:
+        return None
+
+    now = time.time()
+    if not force and os.path.exists(AUTO_CLEANUP_MARKER):
+        try:
+            last = os.path.getmtime(AUTO_CLEANUP_MARKER)
+            if now - last < AUTO_CLEANUP_INTERVAL_HOURS * 3600:
+                return None
+        except OSError:
+            pass
+
+    try:
+        r_logs = prune_logs(AUTO_CLEANUP_LOGS_DAYS, dry_run=False)
+        r_results = prune_results(AUTO_CLEANUP_RESULTS_DAYS, dry_run=False)
+        r_rbs = prune_rbs(
+            AUTO_CLEANUP_RBS_DAYS,
+            status_filter=["error", "cancelled", "max_iterations"],
+            dry_run=False,
+        )
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+    try:
+        with open(AUTO_CLEANUP_MARKER, "w", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%dT%H:%M:%S"))
+    except OSError:
+        pass
+
+    return {
+        "ran_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "logs_removed": r_logs.count,
+        "results_removed": r_results.count,
+        "rbs_removed": r_rbs.count,
+        "bytes_freed": r_logs.freed_bytes + r_results.freed_bytes,
+    }
 
 
 def _fmt(b: int) -> str:

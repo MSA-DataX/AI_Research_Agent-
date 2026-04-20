@@ -11,18 +11,20 @@ from embeddings import cosine, embed
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS research_box (
-    id              TEXT PRIMARY KEY,
-    task            TEXT NOT NULL,
-    status          TEXT NOT NULL,
-    sources         TEXT NOT NULL,
-    visited_sources TEXT NOT NULL,
-    extracted_data  TEXT,
-    entities        TEXT,
-    validation      TEXT,
-    iterations      INTEGER DEFAULT 0,
-    embedding       TEXT,
-    created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL
+    id                  TEXT PRIMARY KEY,
+    task                TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    sources             TEXT NOT NULL,
+    visited_sources     TEXT NOT NULL,
+    extracted_data      TEXT,
+    entities            TEXT,
+    validation          TEXT,
+    iterations          INTEGER DEFAULT 0,
+    embedding           TEXT,
+    output_fields       TEXT,
+    validation_history  TEXT,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rb_updated ON research_box(updated_at);
 """
@@ -32,6 +34,11 @@ def _conn() -> sqlite3.Connection:
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
     c.executescript(_SCHEMA)
+    existing = {row[1] for row in c.execute("PRAGMA table_info(research_box)").fetchall()}
+    if "output_fields" not in existing:
+        c.execute("ALTER TABLE research_box ADD COLUMN output_fields TEXT")
+    if "validation_history" not in existing:
+        c.execute("ALTER TABLE research_box ADD COLUMN validation_history TEXT")
     return c
 
 
@@ -63,6 +70,8 @@ class ResearchBox:
         self.validation: dict = _j_load(row.get("validation"), {})
         self.iterations: int = int(row.get("iterations") or 0)
         self.embedding: list[float] = _j_load(row.get("embedding"), [])
+        self.output_fields: list[str] = _j_load(row.get("output_fields"), []) or []
+        self.validation_history: list[dict] = _j_load(row.get("validation_history"), []) or []
         self.created_at: str = row.get("created_at") or _now()
         self.updated_at: str = row.get("updated_at") or _now()
 
@@ -73,8 +82,9 @@ class ResearchBox:
                 """
                 INSERT OR REPLACE INTO research_box
                 (id, task, status, sources, visited_sources, extracted_data, entities,
-                 validation, iterations, embedding, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                 validation, iterations, embedding, output_fields, validation_history,
+                 created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     self.id,
@@ -87,6 +97,8 @@ class ResearchBox:
                     json.dumps(self.validation, ensure_ascii=False),
                     self.iterations,
                     json.dumps(self.embedding) if self.embedding else None,
+                    json.dumps(self.output_fields, ensure_ascii=False) if self.output_fields else None,
+                    json.dumps(self.validation_history, ensure_ascii=False) if self.validation_history else None,
                     self.created_at,
                     self.updated_at,
                 ),
@@ -104,18 +116,48 @@ class ResearchBox:
             "entities": self.entities,
             "validation": self.validation,
             "iterations": self.iterations,
+            "output_fields": self.output_fields,
+            "validation_history": self.validation_history,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
 
+    def append_validation_snapshot(self) -> None:
+        """Append current validation as a timeline entry (kept last 20)."""
+        v = self.validation or {}
+        if not v:
+            return
+        snap = {
+            "ts": _now(),
+            "mode": v.get("mode", "validate"),
+            "confidence": v.get("confidence"),
+            "label": v.get("label"),
+            "total": v.get("total"),
+            "supported": v.get("supported"),
+            "methods_used": v.get("methods_used"),
+            "methods_summary": v.get("methods_summary"),
+        }
+        self.validation_history = (self.validation_history or []) + [snap]
+        self.validation_history = self.validation_history[-20:]
+
     def add_sources(self, urls) -> None:
+        from url_utils import canonicalize_url
+        seen = {canonicalize_url(u) for u in self.sources}
         for u in urls or []:
-            if u and u not in self.sources:
-                self.sources.append(u)
+            if not u:
+                continue
+            canon = canonicalize_url(u)
+            if canon not in seen:
+                self.sources.append(canon)
+                seen.add(canon)
 
     def mark_visited(self, url: str) -> None:
-        if url and url not in self.visited_sources:
-            self.visited_sources.append(url)
+        from url_utils import canonicalize_url
+        if not url:
+            return
+        canon = canonicalize_url(url)
+        if canon not in {canonicalize_url(u) for u in self.visited_sources}:
+            self.visited_sources.append(canon)
 
 
 def create(task: str) -> ResearchBox:

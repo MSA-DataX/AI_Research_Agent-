@@ -8,26 +8,51 @@ Lokaler, autonomer Research-Agent mit Streamlit-UI, REST-API (FastAPI) und SQLit
 
 ```
 D:\AI_agent\
-├── app.py                 # Streamlit Web-UI        (Port 8501)
-├── api.py                 # FastAPI REST-API         (Port 8000)
+├── app.py                 # Streamlit Web-UI (Port 8501)
+├── api.py                 # FastAPI REST-API (Port 8000)
 ├── main.py                # CLI-Einstiegspunkt
-├── start.py               # Combined Launcher (API + UI parallel)
+├── start.py               # Combined Launcher (API + UI, Port-Check, Model-Preload)
 │
-├── agent.py               # Agent-Loop (ReAct + Planning + Tool-Calls)
-├── research_box.py        # SQLite-Persistenz + Embedding-Reuse
-├── validation.py          # Confidence-Scoring (strukturell)
-├── tools.py               # web_search, fetch_url, extract_contacts, save_json, ...
+├── agent.py               # Agent-Loop (ReAct + Planning + Tool-Calls + Auto-Fetch)
+├── research_box.py        # SQLite-Persistenz + Embedding-Reuse + Validation-History
+├── validation.py          # Strukturelle Re-Validation (schnell, offline)
+├── validators.py          # 8 Deep-Validation-Methoden + Gewichtung
+├── tools.py               # web_search, fetch_url, extract_contacts, save_json + FIFO-Cache + Retry
 ├── llm_client.py          # OpenAI-kompatibler Client für LM Studio
 ├── embeddings.py          # Cosine-Similarity + nomic-Embed Wrapper
-├── config.py              # ENV-basierte Settings
+├── url_utils.py           # URL-Kanonisierung (www/tracking params/trailing slash)
+├── dedup.py               # Item-Merge mit Name- und Source-basiertem Dedup
+├── jobs.py                # Async-Job-Queue (Thread-basiert, FIFO 500, thread-safe)
+├── security.py            # API-Key-Middleware + Rate-Limit (Sliding-Window)
+├── cleanup.py             # Auto-Cleanup Logs/Results/RBs + Throttle-Marker
+├── api_models.py          # Pydantic-Response-Models für typed API
+├── config.py              # ENV-basierte Settings (zentral)
 │
-├── requirements.txt       # pip-Dependencies
+├── requirements.txt       # pip-Dependencies (pydantic 2.7 pinned)
+├── cleanup.bat            # Windows-Batch für Task-Scheduler
+├── scripts/
+│   └── register_cleanup_task.ps1  # Registriert wöchentlichen Cleanup-Job
 ├── .gitignore
 │
-├── research.db            # SQLite-DB (Research Boxes) — wird beim 1. Run erzeugt
-├── memory.json            # ⚠️ Altbestand (kann gelöscht werden)
+├── research.db            # SQLite-DB (wird beim 1. Run erzeugt)
+├── .last_cleanup          # Timestamp der letzten Auto-Cleanup-Durchführung
 │
-├── results/               # JSON-Ergebnisdateien aus save_json
+├── tests/                 # 126 pytest-Tests (keine LM Studio nötig)
+│   ├── conftest.py        # Fixtures: tmp_db, fake_embed
+│   ├── agent_fakes.py     # Mock-Helper: fake_chat_response, queued_chat_with_tools
+│   ├── test_agent.py      # 17 Tests für agent.py
+│   ├── test_api.py        # API-Endpoint-Tests (TestClient)
+│   ├── test_cleanup.py    # Cleanup + Auto-Cleanup Tests
+│   ├── test_dedup.py      # Item-Merge + Dedup
+│   ├── test_integration.py # E2E mit gemockten Tools
+│   ├── test_jobs.py       # Async-Job-Queue
+│   ├── test_research_box.py # SQLite CRUD + History
+│   ├── test_security.py   # API-Key + Rate-Limit + CORS
+│   ├── test_url_utils.py  # URL-Kanonisierung
+│   ├── test_validation.py # Strukturelle Validation
+│   └── test_validators.py # 8 Deep-Methoden + Gewichtung
+│
+├── results/               # JSON-Ergebnisse (save_json-Tool)
 ├── logs/                  # Trace-Logs pro Run (run_YYYYMMDD_HHMMSS.json)
 └── venv/                  # Python Virtual Environment
 ```
@@ -37,38 +62,39 @@ D:\AI_agent\
 ## 🧩 Modul-Abhängigkeiten
 
 ```
-┌───────────────┐     ┌───────────────┐     ┌───────────────┐
-│   app.py      │     │   api.py      │     │   main.py     │
-│ (Streamlit)   │     │  (FastAPI)    │     │    (CLI)      │
-└───────┬───────┘     └───────┬───────┘     └───────┬───────┘
-        │                     │                     │
-        └─────────────────────┼─────────────────────┘
-                              ▼
-                      ┌───────────────┐
-                      │   agent.py    │  ◄──── Agent-Loop
-                      │  run, verify, │
-                      │  validate_rb  │
-                      └───────┬───────┘
-              ┌───────────────┼────────────────┐
-              ▼               ▼                ▼
-      ┌──────────────┐ ┌──────────────┐ ┌────────────────┐
-      │   tools.py   │ │ llm_client.py│ │research_box.py │
-      │  web_search, │ │ chat,        │ │ ResearchBox,   │
-      │  fetch_url,  │ │ chat_with_   │ │ create, load,  │
-      │  extract_    │ │ tools        │ │ find_similar   │
-      │  contacts    │ └──────┬───────┘ └────────┬───────┘
-      └──────────────┘        │                  │
-                              ▼                  ▼
-                      ┌───────────────┐  ┌──────────────┐
-                      │ LM Studio     │  │ embeddings.py│
-                      │ :1234/v1      │  │ (cosine,     │
-                      │               │  │  embed)      │
-                      └───────────────┘  └──────────────┘
-                              ▼
-                      ┌───────────────┐
-                      │  validation.py│
-                      │   compute()   │
-                      └───────────────┘
+┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+│  app.py  │  │  api.py  │  │ main.py  │  │ start.py │
+│(Streamlit)  │(FastAPI) │  │  (CLI)   │  │(Launcher)│
+└────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘
+     │             │             │             │
+     │       ┌─────┴─────┐       │             │
+     │       │api_models │       │             │
+     │       │security.py│       │             │
+     │       │ jobs.py   │       │             │
+     │       └─────┬─────┘       │             │
+     │             │             │             │
+     └─────────────┴─────────────┴─────────────┘
+                   │
+                   ▼
+            ┌─────────────┐       ┌──────────────┐
+            │  agent.py   │◄──────┤ cleanup.py   │
+            │  run()      │       └──────────────┘
+            │  verify_rb  │
+            │  analyze_   │
+            │  extend_rb  │
+            └──────┬──────┘
+     ┌────────────┬┴───┬─────────────┬─────────────┐
+     ▼            ▼    ▼             ▼             ▼
+┌────────┐  ┌──────┐  ┌─────────┐  ┌──────────┐  ┌────────┐
+│tools.py│  │llm_  │  │research_│  │validators│  │valid-  │
+│        │  │client│  │box.py   │  │.py (8)   │  │ation   │
+└────┬───┘  └──┬───┘  └────┬────┘  └────┬─────┘  │.py     │
+     │         │           │            │         └────────┘
+     ▼         ▼           ▼            ▼
+┌─────────┐ ┌──────┐ ┌──────────┐  ┌──────┐
+│url_utils│ │ LM   │ │embeddings│  │dedup │
+│dedup.py │ │Studio│ │.py       │  │.py   │
+└─────────┘ └──────┘ └──────────┘  └──────┘
 ```
 
 ---
@@ -77,68 +103,127 @@ D:\AI_agent\
 
 ### Einstiegspunkte
 
-| Datei | Rolle | Start-Befehl |
+| Datei | Rolle | Start |
 |---|---|---|
-| [app.py](app.py) | Streamlit Web-UI mit Live-Fortschritt, Tabs, Commands | `streamlit run app.py` |
-| [api.py](api.py) | FastAPI REST-Server mit `/research_box/*` Endpoints | `python api.py` |
-| [main.py](main.py) | CLI (1 Task → 1 Ergebnis als JSON) | `python main.py "dein Task"` |
-| [start.py](start.py) | Startet API + UI parallel | `python start.py` |
+| [app.py](app.py) | Streamlit UI mit 3 Tabs, Live-Progress, Commands, Row-Editing | `streamlit run app.py` |
+| [api.py](api.py) | FastAPI mit 12 Endpoints, Swagger-Auth, Typed Responses | `python api.py` |
+| [main.py](main.py) | CLI (1 Task → JSON) | `python main.py "task"` |
+| [start.py](start.py) | Startet API + UI, prüft Port 8000, lädt Modell via `lms` | `python start.py` |
 
 ### Kern-Logik
 
 | Datei | Inhalt |
 |---|---|
-| [agent.py](agent.py) | `run()` (ReAct-Loop mit Tool-Calling), `_plan()` (Planner), `verify_rb()` (Re-Fetch + Substring-Check), `validate_rb()`, `extend_rb()` |
-| [research_box.py](research_box.py) | `ResearchBox`-Klasse, SQLite-Schema, `create / load / list_all / delete / find_similar / recall_hints` |
-| [validation.py](validation.py) | `compute()` — Confidence basierend auf `source_url ∈ visited_sources × min(1, n_sources/3)` |
-| [tools.py](tools.py) | 5 Agent-Tools + Tool-Schemas für OpenAI-Function-Calling + FIFO-Caches |
+| [agent.py](agent.py) | `run()` (ReAct+Planning+Auto-Fetch), `_plan()`, `verify_rb()`, `validate_rb()`, `extend_rb(rounds=N)`, `analyze_rows_rb(methods)` mit parallelen LLM-Calls |
+| [research_box.py](research_box.py) | `ResearchBox`-Klasse mit 14 Spalten, `create / load / list_all / delete / find_similar / recall_hints`, `append_validation_snapshot()` für Timeline |
+| [validators.py](validators.py) | 8 Methoden + `METHOD_WEIGHTS` + `verdict_for_row()` (gewichtet) + `TRUSTED_DOMAINS`-Liste |
+| [validation.py](validation.py) | `compute()` — schnelle strukturelle Confidence (kein Netz, kein LLM) |
+| [tools.py](tools.py) | 5 Tools + Schemas + FIFO-Cache (128 Einträge) + `_retry()` (Exponential Backoff) |
+| [dedup.py](dedup.py) | `merge_items()` — Dedup per normalisiertem Name ODER kanonischer URL |
+| [url_utils.py](url_utils.py) | `canonicalize_url()` — strip www/trailing-slash/UTM/fbclid, sortiert Query-Keys |
 
 ### Infrastruktur
 
 | Datei | Inhalt |
 |---|---|
-| [llm_client.py](llm_client.py) | OpenAI-Client (LM Studio), `chat()`, `chat_with_tools()`, liest `MODEL_NAME` dynamisch aus env |
-| [embeddings.py](embeddings.py) | `embed()` (nomic via LM Studio), `cosine()` |
-| [config.py](config.py) | ENV-Konstanten: `LM_STUDIO_BASE_URL`, `MODEL_NAME`, `EMBEDDING_MODEL`, `DB_PATH`, `API_PORT`, `MAX_ITERATIONS`, Thresholds |
+| [llm_client.py](llm_client.py) | `chat()`, `chat_with_tools()`, `_current_model()` liest `MODEL_NAME` dynamisch aus env |
+| [embeddings.py](embeddings.py) | `embed()` via nomic in LM Studio, `cosine()` (reine Python) |
+| [config.py](config.py) | Zentrale ENV-Konstanten (12 Variablen) |
+| [api_models.py](api_models.py) | `TaskIn`, `ResearchBoxOut`, `ValidationReport`, `JobStatus`, `PagedResearchBoxes`, etc. |
+| [security.py](security.py) | `security_middleware()` — API-Key-Check + Rate-Limit, public-Endpoints exempt |
+| [jobs.py](jobs.py) | In-Memory Job-Store (Lock-safe), `run_async()` spawnt Daemon-Thread |
+| [cleanup.py](cleanup.py) | `prune_logs/results/rbs()`, `auto_cleanup()` mit 24h-Throttle |
+
+### Tests (126)
+
+| Datei | Tests |
+|---|---:|
+| test_agent.py | 17 |
+| test_validators.py | 37 |
+| test_research_box.py | 11 |
+| test_security.py | 11 |
+| test_url_utils.py | 11 |
+| test_api.py | 9 |
+| test_jobs.py | 8 |
+| test_dedup.py | 8 |
+| test_cleanup.py | 8 |
+| test_validation.py | 5 |
+| test_integration.py | 2 |
 
 ### Runtime-Daten
 
 | Pfad | Zweck |
 |---|---|
-| `research.db` | SQLite — alle Research Boxes (tasks, sources, visited, extracted_data, entities, validation, embedding) |
-| `results/*.json` | Strukturierte Ergebnisdateien (`save_json`-Tool) |
-| `logs/run_*.json` | Vollständige Trace-Logs jedes Runs (jeder Schritt) |
-| `memory.json` | ⚠️ Altbestand aus früherer Version — ersetzt durch `research.db` |
+| `research.db` | SQLite — alle Research Boxes (task, sources, visited, extracted_data, entities, validation, validation_history, output_fields, embedding) |
+| `results/*.json` | Strukturierte Ergebnis-Dateien vom `save_json`-Tool |
+| `logs/run_*.json` | Trace-Logs pro Run (jeder Tool-Call, jede Observation) |
+| `.last_cleanup` | Timestamp der letzten Auto-Cleanup-Durchführung (Throttle-Marker) |
 
 ---
 
-## 🛠️ Agent-Tools (verfügbar für das LLM)
+## 🛠️ Agent-Tools
 
-| Tool | Zweck | Return |
-|---|---|---|
-| `web_search(query, max_results, region)` | DDGS-Suche, mit FIFO-Cache | `list[{title, url, snippet}]` |
-| `web_search_parallel(queries, max_results)` | N Suchen parallel (Threads) | `dict[query → results]` |
-| `fetch_url(url, max_chars)` | HTML holen, script/nav entfernen | gereinigter Text |
-| `extract_contacts(text)` | Regex für E-Mail/Telefon/PLZ-Adresse | `{emails, phones, addresses}` |
-| `save_json(filename, data)` | JSON in `results/` speichern | Dateipfad |
-| `finish(result)` | Task beenden, Ergebnis zurückgeben | Final-Result |
+| Tool | Zweck | Cache? |
+|---|---|:---:|
+| `web_search(query, max_results, region)` | DDGS-Suche mit Retries | ✅ FIFO 128 |
+| `web_search_parallel(queries, max_results)` | N Suchen parallel (Threads) | ❌ |
+| `fetch_url(url, max_chars)` | HTML holen, scripts/nav entfernen | ✅ FIFO 128 |
+| `extract_contacts(text)` | Regex: E-Mail/Telefon/PLZ-Adresse | ❌ |
+| `save_json(filename, data)` | JSON in `results/` speichern | ❌ |
+| `finish(result)` | Task beenden + Auto-Fetch-Fallback | — |
 
 ---
 
-## 🌐 API-Endpoints (FastAPI)
+## 🌐 API-Endpoints (12)
 
 Swagger: **http://localhost:8000/docs**
 
+### Research Boxes
 | Methode | Pfad | Zweck |
 |---|---|---|
-| `GET` | `/research_box` | Alle RBs listen |
-| `GET` | `/research_box/{id}` | Einzelne RB |
-| `POST` | `/research_box` | Neue RB aus `{"task": "..."}` |
-| `POST` | `/research_box/{id}/validate` | Re-Validate (strukturell) |
-| `POST` | `/research_box/{id}/verify` | Verify (re-fetch + Substring-Check) |
-| `POST` | `/research_box/{id}/extend` | Erweitern (nur neue Quellen) |
+| `GET` | `/` | Endpoint-Index + Security-Status |
+| `GET` | `/research_box?offset=&limit=` | Paginiert |
+| `GET` | `/research_box/{id}` | Einzel |
+| `POST` | `/research_box?background=false` | Task starten (sync oder async) |
+| `POST` | `/research_box/{id}/validate` | Strukturelle Re-Validation |
+| `POST` | `/research_box/{id}/verify` | Quellen re-fetchen + Substring |
+| `POST` | `/research_box/{id}/analyze_rows?methods=` | Deep-Analyse (8 Methoden) |
+| `POST` | `/research_box/{id}/extend?background=false` | Search More |
+| `GET` | `/research_box/{id}/validation` | Nur Validation-Daten |
 | `GET` | `/research_box/{id}/export?fmt=csv\|json` | Export |
 | `DELETE` | `/research_box/{id}` | Löschen |
+
+### Jobs + Meta
+| Methode | Pfad | Zweck |
+|---|---|---|
+| `GET` | `/jobs?offset=&limit=` | Paginierte Job-Liste |
+| `GET` | `/jobs/{job_id}` | Job-Status |
+| `GET` | `/validation_methods` | Dict der 8 Methoden |
+
+---
+
+## 🔒 Validierungs-Methoden & Gewichtung
+
+```
+┌──────────────────────────────┬────────┬─────────────────────────────┐
+│ Methode                      │ Weight │ Was sie prüft               │
+├──────────────────────────────┼────────┼─────────────────────────────┤
+│ llm_semantic                 │  0.22  │ LLM: stützt Seite Item?     │
+│ consistency                  │  0.18  │ LLM: Felder intern passend? │
+│ cross_source                 │  0.14  │ N Domains bestätigen Name   │
+│ relationship_validation      │  0.14  │ LLM: Relationen korrekt?    │
+│ domain_trust                 │  0.12  │ Wikipedia/Staat > Quiz      │
+│ all_fields                   │  0.10  │ Alle Felder in Seite        │
+│ name_substring               │  0.05  │ Name in Seite               │
+│ field_completeness           │  0.05  │ % ausgefüllte Felder        │
+├──────────────────────────────┼────────┤                             │
+│ Σ                            │  1.00  │                             │
+└──────────────────────────────┴────────┴─────────────────────────────┘
+```
+
+**LLM-Calls parallelisiert** in `analyze_rows_rb()`: `llm_semantic`, `consistency`, `relationship_validation` laufen für jede Zeile gleichzeitig (ThreadPoolExecutor, max 3 Workers).
+
+**Labels:** `high` ≥ 85 · `medium` ≥ 60 · `low` ≥ 30 · `unverified` < 30
 
 ---
 
@@ -146,18 +231,20 @@ Swagger: **http://localhost:8000/docs**
 
 ```sql
 CREATE TABLE research_box (
-    id              TEXT PRIMARY KEY,       -- 12-char uuid hex
-    task            TEXT NOT NULL,
-    status          TEXT NOT NULL,          -- running|completed|verified|error|cancelled|max_iterations
-    sources         TEXT NOT NULL,          -- JSON: alle entdeckten URLs
-    visited_sources TEXT NOT NULL,          -- JSON: per fetch_url tatsächlich besuchte
-    extracted_data  TEXT,                   -- JSON: finales Ergebnis
-    entities        TEXT,                   -- JSON: {emails, phones, addresses, ...}
-    validation      TEXT,                   -- JSON: {confidence, label, per_item, ...}
-    iterations      INTEGER DEFAULT 0,
-    embedding       TEXT,                   -- JSON: nomic-Embedding des Tasks
-    created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL
+    id                  TEXT PRIMARY KEY,    -- 12-char uuid hex
+    task                TEXT NOT NULL,
+    status              TEXT NOT NULL,       -- running|completed|verified|error|cancelled|max_iterations
+    sources             TEXT NOT NULL,       -- JSON: alle entdeckten URLs (kanonisiert)
+    visited_sources     TEXT NOT NULL,       -- JSON: per fetch_url tatsächlich besuchte
+    extracted_data      TEXT,                -- JSON: finales Ergebnis
+    entities            TEXT,                -- JSON: {emails, phones, addresses, ...}
+    validation          TEXT,                -- JSON: aktueller Validation-Report
+    iterations          INTEGER DEFAULT 0,
+    embedding           TEXT,                -- JSON: nomic-Embedding (task)
+    output_fields       TEXT,                -- JSON: erzwungene Schema-Felder
+    validation_history  TEXT,                -- JSON: letzte 20 Validation-Snapshots (Timeline)
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
 );
 CREATE INDEX idx_rb_updated ON research_box(updated_at);
 ```
@@ -166,35 +253,40 @@ CREATE INDEX idx_rb_updated ON research_box(updated_at);
 
 ## ⚙️ Konfiguration (config.py)
 
-| ENV-Variable | Default | Zweck |
+| ENV | Default | Bereich |
 |---|---|---|
-| `LM_STUDIO_BASE_URL` | `http://localhost:1234/v1` | LM Studio Endpoint |
-| `LM_STUDIO_API_KEY` | `lm-studio` | Dummy-Key |
-| `MODEL_NAME` | `local-model` | Chat-Modell |
-| `EMBEDDING_MODEL` | `text-embedding-nomic-embed-text-v1.5` | Embedding-Modell |
-| `API_HOST` | `127.0.0.1` | FastAPI Host |
-| `API_PORT` | `8000` | FastAPI Port |
-| `MAX_ITERATIONS` | `15` | Max Tool-Steps pro Run |
-| `SIMILARITY_REUSE_THRESHOLD` | `0.72` | ab wann find_similar eine alte RB wiederverwendet |
+| `LM_STUDIO_BASE_URL` | `http://localhost:1234/v1` | LM Studio |
+| `MODEL_NAME` | `local-model` | LM Studio |
+| `EMBEDDING_MODEL` | `text-embedding-nomic-embed-text-v1.5` | LM Studio |
+| `API_HOST` / `API_PORT` | `127.0.0.1` / `8000` | FastAPI |
+| `API_KEY` | `""` | Security |
+| `RATE_LIMIT_PER_MINUTE` | `0` | Security |
+| `CORS_ORIGINS` | `localhost:8501,127.0.0.1:8501` | Security |
+| `AUTO_CLEANUP` | `1` | Cleanup |
+| `AUTO_CLEANUP_INTERVAL_HOURS` | `24` | Cleanup |
+| `AUTO_CLEANUP_LOGS_DAYS` | `30` | Cleanup |
+| `AUTO_CLEANUP_RESULTS_DAYS` | `30` | Cleanup |
+| `AUTO_CLEANUP_RBS_DAYS` | `90` | Cleanup |
+| `MAX_ITERATIONS` | `15` | Agent |
+| `SIMILARITY_REUSE_THRESHOLD` | `0.72` | Agent |
 
 ---
 
 ## 🚀 Schnellstart
 
 ```powershell
-# 1. venv aktivieren
 cd D:\AI_agent
 .\venv\Scripts\Activate.ps1
-
-# 2. LM Studio: qwen3-14b laden, Server auf :1234 starten
-lms load qwen3-14b
-
-# 3. Variante A: beides zusammen
+lms load qwen3-14b --ttl 0
 python start.py
+```
 
-# 3. Variante B: einzeln
-python api.py                    # API  → http://localhost:8000/docs
-streamlit run app.py             # UI   → http://localhost:8501
+Oder einzeln:
+```powershell
+python api.py                       # API
+streamlit run app.py                # UI
+python main.py "task"               # CLI
+python -m pytest tests/             # Tests (kein LM Studio nötig)
 ```
 
 ---
@@ -203,24 +295,27 @@ streamlit run app.py             # UI   → http://localhost:8501
 
 | Modus | UI-Button | Was passiert |
 |---|---|---|
-| **Neuer Task** | 🚀 Starten | Neue RB (oder find_similar reuse), voller Search-Loop |
-| **Nur neue Quellen** | ➕ | `extend=True` — visited_sources werden aus allen Suchergebnissen gefiltert, bevor das LLM sie sieht |
-| **Verifizieren** | 🔍 | Für jede `source_url` in `extracted_data`: fetch_url + Substring-Check ob Item-Name in der Seite steht |
-| **Re-Validate** | ✅ | Schnelle strukturelle Prüfung (ohne Netzwerk) |
-| **Export** | ⬇️ JSON/CSV/Excel | Download aus UI oder `GET /export?fmt=...` |
+| **Neuer Task** | 🚀 Starten | Neue RB (oder find_similar), Search-Loop |
+| **Multi-Round Extend** | ➕ Neue Quellen (1-5) | N Runden, Dedup + strikter Visited-Filter |
+| **Verifizieren** | 🔍 Verify | Re-Fetch + Substring (schnell) |
+| **Deep-Analyse** | 🔬 Deep | 8 Methoden, LLM-Calls parallel |
+| **Re-Validate** | ✅ | Struktur-Check (ohne Netz) |
+| **Bearbeiten** | ✏️ | Zellen inline editieren, Zeilen löschen |
+| **Export** | ⬇️ JSON/CSV/Excel | Download oder `GET /export` |
 
 ---
 
-## 🧪 Was noch fehlt (ehrliche Liste)
+## 🔐 Security-Features
 
-- [ ] **Tests** (pytest) für `validation.py`, `research_box.py`, API-Endpoints
-- [ ] **memory.json** entfernen (Altbestand)
-- [ ] Verify **schärfen** — nicht nur Namen-Substring, sondern einzelne Felder (Adresse, Funding, etc.) gezielt prüfen
-- [ ] **Retries** bei transienten DDGS/HTTP-Fehlern
-- [ ] **LLM-Streaming** in der UI
-- [ ] **Kontext-Kompression** bei langen Runs (jetzt wächst die Message-History linear)
-- [ ] **Skalierung** von `find_similar` ab ~1000 RBs (aktuell lädt alle in RAM)
+| Feature | Aktivierung | Default |
+|---|---|:---:|
+| API-Key (`X-API-Key` Header) | `API_KEY=<token>` setzen | Aus |
+| Rate-Limit (per IP, 60s-Window) | `RATE_LIMIT_PER_MINUTE=60` | 0 (aus) |
+| CORS (spezifische Origins) | `CORS_ORIGINS=...` | localhost:8501 |
+| Swagger-Authorize-Button | Automatisch wenn API_KEY gesetzt | — |
+
+Public-Endpoints (keine Auth nötig): `/`, `/docs`, `/redoc`, `/openapi.json`, `/favicon.ico`
 
 ---
 
-*Stand: 2026-04-19*
+*Stand: 2026-04-20*
